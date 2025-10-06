@@ -1,75 +1,86 @@
-# BikeShareAnalysis.R
-# Linear Regression for Kaggle Bike Sharing
-# -----------------------------------------
+# BikeShare.R
+# Kaggle Bike Sharing Demand Competition
+# Regression Tree Workflow with tidymodels
+# --------------------------------------------------------
 
+# --- Libraries ---
 library(tidyverse)
 library(lubridate)
+library(tidymodels)
 library(vroom)
 
-# --- Load data with vroom ---
-train <- vroom("train.csv", col_types = cols(datetime = col_datetime(format = "%Y-%m-%d %H:%M:%S")))
-test  <- vroom("test.csv",  col_types = cols(datetime = col_datetime(format = "%Y-%m-%d %H:%M:%S")))
+set.seed(123)
 
-# --- Feature Engineering ---
-add_datetime_features <- function(df) {
-  df %>%
-    mutate(
-      hour       = hour(datetime),
-      day        = day(datetime),
-      month      = month(datetime),
-      year       = ifelse(year(datetime) == 2011, 0, 1),
-      dayofweek  = wday(datetime, week_start = 1) - 1, # Monday = 0
-      is_weekend = ifelse(dayofweek >= 5, 1, 0)
-    )
-}
+# --- Load Data ---
+train <- vroom("train.csv")
+test  <- vroom("test.csv")
 
-train <- add_datetime_features(train)
-test  <- add_datetime_features(test)
+# --- Cleaning Section ---
+train <- train %>%
+  select(-casual, -registered) %>%
+  mutate(count = log(count + 1))   # log-transform target
 
-# --- Target: log(count) ---
-train$log_count <- log1p(train$count)
+# --- Feature Engineering Section ---
+bike_rec <- recipe(count ~ ., data = train) %>%
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  step_mutate(hour = lubridate::hour(datetime)) %>%
+  step_rm(datetime) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
 
-# --- Fit linear regression ---
-# (exclude casual and registered as predictors)
-lm_model <- lm(
-  log_count ~ season + weather + holiday + workingday +
-    temp + atemp + humidity + windspeed +
-    hour + day + month + year + dayofweek + is_weekend,
-  data = train
+# --- Regression Tree Section ---
+# Define regression tree model (CART)
+tree_mod <- decision_tree(
+  cost_complexity = tune(),  # pruning parameter
+  tree_depth = tune(),       # maximum depth of tree
+  min_n = tune()             # minimum observations per node
+) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+
+# Workflow with recipe + model
+tree_wf <- workflow() %>%
+  add_model(tree_mod) %>%
+  add_recipe(bike_rec)
+
+# Cross-validation folds
+folds <- vfold_cv(train, v = 5)
+
+# Define grid of hyperparameters
+tree_grid <- grid_regular(
+  cost_complexity(),
+  tree_depth(),
+  min_n(),
+  levels = 3  # 3x3x3 grid = 27 combinations
 )
 
-summary(lm_model)
+# Tune the regression tree
+tree_tune <- tune_grid(
+  tree_wf,
+  resamples = folds,
+  grid = tree_grid,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
 
-# --- Predict on test set ---
-test$pred_log <- predict(lm_model, newdata = test)
-test$pred     <- pmax(0, expm1(test$pred_log))  # back-transform and clip negatives
+# Select best model by RMSE
+best_tree <- select_best(tree_tune, metric = "rmse")
+best_tree
 
-# --- Build submission (fixed) ---
-submission <- test %>%
-  mutate(
-    datetime = format(datetime, "%Y-%m-%d %H:%M:%S"),
-    count = round(pred)
-  ) %>%
+# Finalize workflow with best parameters
+final_tree_wf <- finalize_workflow(tree_wf, best_tree)
+
+# Fit final regression tree on all training data
+final_tree_fit <- final_tree_wf %>%
+  fit(data = train)
+
+# --- Predict Test Set ---
+test_pred <- predict(final_tree_fit, test) %>%
+  bind_cols(test %>% select(datetime)) %>%
+  mutate(count = round(exp(.pred) - 1)) %>%
   select(datetime, count)
 
-# --- Save submission with vroom_write ---
-vroom_write(submission, "submission.csv", delim = ",")
+# --- Save Submission File ---
+vroom_write(test_pred, "submission.csv")
 
-cat("Submission saved to submission.csv\n")
-print(head(submission))
-
-
-weather_plot <- ggplot(data = bike, aes(x = weather)) +
-  geom_bar()
-
-temp_plot <- ggplot(data=bike, aes(x=temp, y=count)) +
-  geom_point() +
-  geom_smooth(se = FALSE)
-
-workday_plot <- ggplot(data = bike, aes(x = workingday)) +
-  geom_bar()
-
-windspeed_plot <- ggplot(bike, aes(x= windspeed, y= count)) + 
-  geom_point()
-
-(weather_plot +windspeed_plot) / (temp_plot + workday_plot)
+# --------------------------------------------------------
+# End of Regression Tree Section
